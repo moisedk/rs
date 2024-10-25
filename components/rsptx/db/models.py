@@ -29,6 +29,7 @@
 # ----------------
 import re
 from typing import Dict, Type
+from datetime import datetime
 
 # Third-party imports
 # -------------------
@@ -564,7 +565,8 @@ class Assignment(Base, IdMixin):
     released = Column(Web2PyBoolean, nullable=False)
     description = Column(Text)
     duedate = Column(DateTime, nullable=False)
-    visible = Column(Web2PyBoolean, nullable=False)
+    # visible = Column(Web2PyBoolean, nullable=False)
+    visible_on = Column(DateTime, default=datetime.utcnow)
     threshold_pct = Column(Float(53))
     allow_self_autograde = Column(Web2PyBoolean)
     is_timed = Column(Web2PyBoolean)
