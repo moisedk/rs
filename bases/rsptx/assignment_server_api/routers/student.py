@@ -207,9 +207,8 @@ async def doAssignment(
         return RedirectResponse("/assignment/student/chooseAssignment")
 
     if (
-        assignment.visible == "F"
-        or assignment.visible is None
-        or assignment.visible == False
+        assignment.visible_on is None
+        or assignment.visible_on > datetime.datetime.utcnow()
     ):
         if await is_instructor(request) is False:
             rslogger.error(
