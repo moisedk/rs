@@ -1306,7 +1306,7 @@ async def fetch_assignments(
     """
 
     if is_visible:
-        vclause = Assignment.visible == is_visible
+        vclause = Assignment.visible_on <= datetime.datetime.now()
     else:
         vclause = True
 
