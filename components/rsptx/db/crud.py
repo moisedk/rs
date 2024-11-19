@@ -64,6 +64,8 @@ from rsptx.db.models import (
     CoursePractice,
     Courses,
     CoursesValidator,
+    DeadlineException,
+    DeadlineExceptionValidator,
     EditorBasecourse,
     Grade,
     GradeValidator,
@@ -173,16 +175,27 @@ async def get_peer_votes(div_id: str, course_name: str, voting_stage: int):
     Provide the answers for a peer instruction multiple choice question.
     What percent of students chose each option. This is used for the Review page of Peer Instruction questions.
     """
-    query = (
-        select(Useinfo.act)
+    # Subquery to get the latest vote for each student
+    subquery = (
+        select(func.max(Useinfo.id).label("max_id"))
         .where(
             (Useinfo.event == "mChoice")
             & (Useinfo.course_id == course_name)
             & (Useinfo.div_id == div_id)
             & Useinfo.act.like(f"%vote{voting_stage}")
         )
+        # Group by student ID to get each student's latest vote
+        .group_by(Useinfo.sid)
+        .subquery()
+    )
+
+    # Querying the Useinfo table for every student's latest votes using the subquery
+    query = (
+        select(Useinfo.act)
+        .join(subquery, Useinfo.id == subquery.c.max_id)
         .order_by(Useinfo.id.desc())
     )
+
     async with async_session() as session:
         result = await session.execute(query)
         ans = result.scalars().all()
@@ -501,6 +514,7 @@ async def create_course(course_info: CoursesValidator) -> None:
     new_course = Courses(**course_info.dict())
     async with async_session.begin() as session:
         session.add(new_course)
+    return new_course
 
 
 async def fetch_courses_for_user(
@@ -537,7 +551,7 @@ async def fetch_courses_for_user(
 #
 async def fetch_users_for_course(course_name: str) -> list[AuthUserValidator]:
     """
-    Retrieve a list of users enrolled in a given course (course_name)
+    Retrieve a list of users/students enrolled in a given course (course_name)
 
     :param course_name: str, the name of the course
     :return: list[AuthUserValidator], a list of AuthUserValidator objects representing the users
@@ -611,6 +625,22 @@ async def create_course_attribute(course_id: int, attr: str, value: str):
     new_attr = CourseAttribute(course_id=course_id, attr=attr, value=value)
     async with async_session.begin() as session:
         session.add(new_attr)
+
+
+async def copy_course_attributes(basecourse_id: int, new_course_id: int):
+    """
+    Copy all course attributes from a base course to a new course
+    """
+    query = select(CourseAttribute).where(CourseAttribute.course_id == basecourse_id)
+    async with async_session() as session:
+        res = await session.execute(query)
+        for row in res.scalars().fetchall():
+            print(row.attr, row.value)
+            new_attr = CourseAttribute(
+                course_id=new_course_id, attr=row.attr, value=row.value
+            )
+            session.add(new_attr)
+        await session.commit()
 
 
 async def get_course_origin(base_course):
@@ -845,6 +875,24 @@ async def create_instructor_course_entry(iid: int, cid: int) -> CourseInstructor
     async with async_session.begin() as session:
         session.add(nci)
     return nci
+
+
+async def fetch_course_students(course_id: int) -> List[AuthUserValidator]:
+    """
+    Retrieve a list of students for the given course id (course_id)
+
+    :param course_id: int, the id of the course
+    :return: List[AuthUserValidator], a list of AuthUserValidator objects representing the students
+    """
+    query = (
+        select(AuthUser)
+        .join(UserCourse, UserCourse.user_id == AuthUser.id)
+        .where(UserCourse.course_id == course_id)
+    )
+    async with async_session() as session:
+        res = await session.execute(query)
+    student_list = [AuthUserValidator.from_orm(x) for x in res.scalars().fetchall()]
+    return student_list
 
 
 # Code
@@ -1304,7 +1352,6 @@ async def fetch_assignments(
     :param is_peer: bool, whether or not the assignment is a peer assignment
     :return: List[AssignmentValidator], a list of AssignmentValidator objects
     """
-
     if is_visible:
         vclause = Assignment.visible_on <= datetime.datetime.now()
     else:
@@ -1916,6 +1963,29 @@ async def fetch_timed_exam(
         return TimedExamValidator.from_orm(res.scalars().first())
 
 
+async def did_start_timed(sid: str, exam_id: str, course_name: str) -> bool:
+    """
+    Retrieve the start time for the given sid, exam_id, and course_name.
+
+    :param sid: str, the student id
+    :param exam_id: str, the id of the timed exam
+    :param course_name: str, the name of the course
+    :return: bool, whether the exam has started
+    """
+    start_query = select(Useinfo).where(
+        and_(
+            Useinfo.sid == sid,
+            Useinfo.div_id == exam_id,
+            Useinfo.course_id == course_name,
+            Useinfo.event == "timedExam",
+            Useinfo.act == "start",
+        )
+    )
+    async with async_session() as session:
+        start = await session.execute(start_query)
+        return start.scalars().first() is not None
+
+
 async def create_timed_exam_entry(
     sid: str, exam_id: str, course_name: str, start_time: datetime
 ) -> TimedExamValidator:
@@ -2496,7 +2566,10 @@ async def fetch_answers(question_id: str, event: str, course_name: str, username
 
 
 async def is_assigned(
-    question_id: str, course_id: int, assignment_id: Optional[int] = None
+    question_id: str,
+    course_id: int,
+    assignment_id: Optional[int] = None,
+    accommodation: Optional[DeadlineExceptionValidator] = None,
 ) -> schemas.ScoringSpecification:
     """
     Check if a question is part of an assignment.
@@ -2524,7 +2597,9 @@ async def is_assigned(
         .where(and_(*clauses))
         .order_by(Assignment.duedate.desc())
     )
-
+    visible_exception = False
+    if accommodation and accommodation.visible:
+        visible_exception = True
     async with async_session() as session:
         res = await session.execute(query)
         for row in res:
@@ -2540,6 +2615,8 @@ async def is_assigned(
                 comment="",
                 question_id=row.Question.id,
             )
+            if accommodation and accommodation.duedate:
+                row.Assignment.duedate += datetime.timedelta(days=accommodation.duedate)
             if datetime.datetime.now(datetime.UTC) <= row.Assignment.duedate.replace(
                 tzinfo=pytz.utc
             ):
@@ -2548,7 +2625,7 @@ async def is_assigned(
                     return scoringSpec
             else:
                 if not row.Assignment.enforce_due and not row.Assignment.released:
-                    if row.Assignment.visible:
+                    if row.Assignment.visible or visible_exception:
                         scoringSpec.assigned = True
                         return scoringSpec
         return schemas.ScoringSpecification()
@@ -2783,3 +2860,76 @@ async def fetch_source_code(
     async with async_session() as session:
         res = await session.execute(query)
         return SourceCodeValidator.from_orm(res.scalars().first())
+
+
+async def fetch_deadline_exception(
+    course_id: int, username: str, assignment_id: int = None, fetch_all: bool = False
+) -> DeadlineExceptionValidator:
+    """
+    Fetch the deadline exception for a given username and assignment_id.
+
+    :param username: str, the username of the student
+    :param assignment_id: int, the id of the assignment
+    :return: DeadlineExceptionValidator, the DeadlineExceptionValidator object
+    """
+    query = (
+        select(DeadlineException)
+        .where(
+            and_(
+                DeadlineException.course_id == course_id,
+                DeadlineException.sid == username,
+            )
+        )
+        .order_by(DeadlineException.id.desc())
+    )
+    time_limit = None
+    deadline = None
+    async with async_session() as session:
+        res = await session.execute(query)
+        if fetch_all:
+            return [
+                DeadlineExceptionValidator.from_orm(row)
+                for row in res.scalars().fetchall()
+            ]
+        for row in res.scalars().fetchall():
+            rslogger.debug(f"{row=}, {assignment_id=}")
+            if assignment_id is not None:
+                if row.assignment_id == assignment_id:
+                    return DeadlineExceptionValidator.from_orm(row)
+            else:
+                if row.time_limit is not None and row.assignment_id is None:
+                    time_limit = row.time_limit
+                if row.duedate is not None and row.assignment_id is None:
+                    deadline = row.duedate
+        return DeadlineExceptionValidator(
+            course_id=course_id, sid=username, time_limit=time_limit, duedate=deadline
+        )
+
+
+async def create_deadline_exception(
+    course_id: int,
+    username: str,
+    time_limit: float,
+    deadline: int,
+    visible: bool,
+    assignment_id: int = None,
+) -> DeadlineExceptionValidator:
+    """
+    Create a new deadline exception for a given username and assignment_id.
+
+    :param username: str, the username of the student
+    :param assignment_id: int, the id of the assignment
+    :return: DeadlineExceptionValidator, the DeadlineExceptionValidator object
+    """
+    new_entry = DeadlineException(
+        course_id=course_id,
+        sid=username,
+        time_limit=time_limit,
+        duedate=deadline,
+        visible=visible,
+        assignment_id=assignment_id,
+    )
+    async with async_session.begin() as session:
+        session.add(new_entry)
+
+    return DeadlineExceptionValidator.from_orm(new_entry)

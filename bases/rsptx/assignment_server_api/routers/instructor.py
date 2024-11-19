@@ -1,4 +1,3 @@
-
 import pathlib
 import pandas as pd
 
@@ -21,6 +20,7 @@ from rsptx.db.crud import (
     fetch_question_count_per_subchapter,
     fetch_all_course_attributes,
     create_assignment_question,
+    create_deadline_exception,
     create_question,
     fetch_course,
     fetch_users_for_course,
@@ -41,7 +41,7 @@ from rsptx.response_helpers.core import (
     make_json_response,
     get_webpack_static_imports,
     get_react_imports,
-    canonical_utcnow
+    canonical_utcnow,
 )
 from rsptx.db.models import (
     AssignmentQuestionValidator,
@@ -282,6 +282,7 @@ async def get_assignment_gb(
     sfirst = students.first_name.to_dict()
     slast = students.last_name.to_dict()
     semail = students.email.to_dict()
+    suser = students.username.to_dict()
     pt = df.pivot(index="sid", columns="assignment", values="score").rename(
         columns=aname
     )
@@ -290,12 +291,19 @@ async def get_assignment_gb(
     pt["first_name"] = pt.index.map(sfirst)
     pt["last_name"] = pt.index.map(slast)
     pt["email"] = pt.index.map(semail)
+    pt["username"] = pt.index.map(suser)
     pt = pt.sort_values(by=["last_name", "first_name"])
-    pt = pt[["first_name", "last_name", "email"] + cols]
+    pt = pt[["first_name", "last_name", "email", "username"] + cols]
     pt = pt.reset_index()
     pt = pt.drop(columns=["sid"], axis=1)
     pt.columns.name = None
 
+    names = {}
+    for ix, row in pt.iterrows():
+        if type(row.first_name) is str and type(row.last_name) is str:
+            names[row.username] = row.first_name + " " + row.last_name
+
+    pt = pt.drop(columns=["username"], axis=1)
     templates = Jinja2Templates(directory=template_folder)
 
     return templates.TemplateResponse(
@@ -307,6 +315,7 @@ async def get_assignment_gb(
                 index=False,
                 na_rep="",
             ),
+            "pt": names,
             "course": course,
             "user": user.username,
             "request": request,
@@ -776,6 +785,20 @@ async def get_grader(
     return await get_builder(request, user, response_class)
 
 
+@router.get("/except")
+async def get_except(
+    request: Request, user=Depends(auth_manager), response_class=HTMLResponse
+):
+    return await get_builder(request, user, response_class)
+
+
+@router.get("/admin")
+async def get_admin(
+    request: Request, user=Depends(auth_manager), response_class=HTMLResponse
+):
+    return await get_builder(request, user, response_class)
+
+
 @router.get("/cancel_lti")
 async def cancel_lti(request: Request, user=Depends(auth_manager)):
     """
@@ -860,3 +883,66 @@ async def process_invoice_request(
     # otherwise FastAPI will use the method of the original request which is a POST
     # in this case
     return RedirectResponse(url=referer, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/course_roster")
+async def get_course_roster(
+    request: Request, user=Depends(auth_manager), response_class=JSONResponse
+):
+    """
+    Get the list of students in the course.
+    """
+
+    students = await fetch_users_for_course(user.course_name)
+    students = [
+        s.model_dump(
+            exclude={
+                "created_on",
+                "modified_on",
+                "password",
+                "reset_password_key",
+                "registration_key",
+            }
+        )
+        for s in students
+    ]
+
+    return make_json_response(status=status.HTTP_200_OK, detail={"students": students})
+
+
+@router.post("/save_exception")
+async def save_exception(
+    request: Request,
+    request_data: dict,
+    user=Depends(auth_manager),
+    response_class=JSONResponse,
+):
+    """
+    Save an exception to the database.
+    """
+    # get the course
+    course = await fetch_course(user.course_name)
+
+    user_is_instructor = await is_instructor(request, user=user)
+    if not user_is_instructor:
+        return make_json_response(
+            status=status.HTTP_401_UNAUTHORIZED, detail="not an instructor"
+        )
+
+    # save the exception
+    res = await create_deadline_exception(
+        course.id,
+        request_data["sid"],
+        request_data["time_limit"],
+        request_data["due_date"],
+        request_data["visible"],
+        request_data["assignment_id"],
+    )
+
+    if not res:
+        return make_json_response(
+            status=status.HTTP_400_BAD_REQUEST,
+            detail="Error saving exception",
+        )
+    else:
+        return make_json_response(status=status.HTTP_200_OK, detail={"success": True})

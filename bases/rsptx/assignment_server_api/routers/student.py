@@ -35,17 +35,23 @@ from rsptx.db.crud import (
     uses_lti,
     fetch_course,
     fetch_all_course_attributes,
+    fetch_deadline_exception,
     fetch_one_assignment,
     fetch_assignment_questions,
     fetch_question_grade,
     fetch_user_chapter_progress,
     fetch_user_sub_chapter_progress,
 )
+from rsptx.grading_helpers.core import check_for_exceptions
 
 from rsptx.db.models import GradeValidator, UseinfoValidation, CoursesValidator
 from rsptx.auth.session import auth_manager, is_instructor
 from rsptx.templates import template_folder
-from rsptx.response_helpers.core import make_json_response, get_webpack_static_imports, canonical_utcnow
+from rsptx.response_helpers.core import (
+    make_json_response,
+    get_webpack_static_imports,
+    canonical_utcnow,
+)
 from rsptx.configuration import settings
 
 
@@ -81,7 +87,15 @@ async def get_assignments(
         is_lti_course = True
     templates = Jinja2Templates(directory=template_folder)
     user_is_instructor = await is_instructor(request, user=user)
-    assignments = await fetch_assignments(course.course_name, is_visible=True)
+    # fetch all assignments, we will filter them using the deadline_exception data
+    assignments = await fetch_assignments(course.course_name)
+    # fetch all deadline exceptions for the user
+    accommodations = await fetch_deadline_exception(
+        course.id, user.username, fetch_all=True
+    )
+    # filter assignments based on deadline exceptions
+    assignment_ids = [a.assignment_id for a in accommodations]
+    assignments = [a for a in assignments if a.visible or a.id in assignment_ids]
     assignments.sort(key=lambda x: x.duedate, reverse=True)
     stats_list = await fetch_all_assignment_stats(course.course_name, user.id)
     stats = {}
@@ -206,11 +220,13 @@ async def doAssignment(
 
         return RedirectResponse("/assignment/student/chooseAssignment")
 
+    deadline_exception = await check_for_exceptions(user, assignment_id)
+
     if (
         assignment.visible_on is None
         or assignment.visible_on > datetime.datetime.utcnow()
     ):
-        if await is_instructor(request) is False:
+        if not (await is_instructor(request) or deadline_exception.visible):
             rslogger.error(
                 f"Attempt to access invisible assignment {assignment_id} by {user.username}"
             )
@@ -229,7 +245,14 @@ async def doAssignment(
     # proficiency exam that you are writing as an rst page that the page containing
     # the exam should be linked to a toctree somewhere so that it gets added.
     #
-
+    # write a sql insert statement to add a visible exception for testuser1 for assignment 187
+    # insert into deadline_exceptions (course_id, assignment_id, visible, time_limit, due_date, user_id)
+    # values ('testcourse', 187, 1, 1, '2020-12-31 23:59:59', 1);
+    if assignment.is_timed:
+        if assignment.time_limit and deadline_exception.time_limit:
+            assignment.time_limit = (
+                assignment.time_limit * deadline_exception.time_limit
+            )
     questions = await fetch_assignment_questions(assignment_id)
 
     await create_useinfo_entry(

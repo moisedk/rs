@@ -1,5 +1,6 @@
-from typing import Union
-from rsptx.db.models import AuthUserValidator
+from typing import Union, List
+from datetime import timedelta
+from rsptx.db.models import AuthUserValidator, DeadlineExceptionValidator
 from rsptx.db.crud import (
     is_assigned,
     fetch_answers,
@@ -9,6 +10,7 @@ from rsptx.db.crud import (
     update_question_grade_entry,
     upsert_grade,
     fetch_assignment_scores,
+    fetch_deadline_exception,
     did_send_messages,
 )
 from rsptx.validation.schemas import (
@@ -16,7 +18,11 @@ from rsptx.validation.schemas import (
     ScoringSpecification,
     ReadingAssignmentSpec,
 )
-from rsptx.db.models import GradeValidator
+from rsptx.db.models import (
+    GradeValidator,
+    AssignmentValidator,
+    DeadlineExceptionValidator,
+)
 from rsptx.logging import rslogger
 
 
@@ -34,8 +40,14 @@ async def grade_submission(
 
     # First figure out if the answer is part of an assignment
     update_total = False
+    accommodation = await fetch_deadline_exception(
+        user.course_id, user.username, submission.assignment_id
+    )
     scoreSpec = await is_assigned(
-        submission.div_id, user.course_id, submission.assignment_id
+        submission.div_id,
+        user.course_id,
+        submission.assignment_id,
+        accommodation=accommodation,
     )
     if scoreSpec.assigned:
         rslogger.debug(
@@ -272,3 +284,40 @@ async def score_reading_page(
         assigned=True, assignment_id=reading_spec.assignment_id
     )
     await compute_total_score(scoreSpec, user)
+
+
+async def check_for_exceptions(
+    user: AuthUserValidator, assignment: int
+) -> DeadlineExceptionValidator:
+    """
+    Check for exceptions that may have been granted for an assignment.
+
+    :param user: The user to check for exceptions.
+    :type user: AuthUserValidator
+    :param assignment: The assignment to check for exceptions.
+    :type assignment: int
+    :return: True if an exception was granted, False otherwise.
+    :rtype: bool
+    """
+    # Check to see if the user has been granted an exception for this assignment
+    exception = await fetch_deadline_exception(
+        user.course_id, user.username, assignment
+    )
+    rslogger.debug(f"deadline exception = {exception}")
+    return exception
+
+
+def adjust_deadlines(
+    assignment_list: List[AssignmentValidator],
+    accommodations: List[DeadlineExceptionValidator],
+) -> List[AssignmentValidator]:
+    """
+    Adjust the deadlines for assignments based on accommodations.
+    """
+    for assignment in assignment_list:
+        for exception in accommodations:
+            if assignment.id == exception.assignment_id:
+                if exception.duedate:
+                    assignment.duedate += timedelta(days=exception.duedate)
+                break
+    return assignment_list
